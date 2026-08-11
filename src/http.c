@@ -2,7 +2,12 @@
 #include<stdio.h>
 #include<sys/socket.h>
 #include<string.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 #define REQUEST_BUFFER_SIZE 4096
+#define FILE_BUFFER_SIZE 4096
 
 typedef struct{
     char method[16];
@@ -94,7 +99,81 @@ int send_response(int client_fd, int status_code, const char *status_text, const
     }
     return 1;
 }
+int send_response_body(int client_fd, int status_code, const char *status_text, 
+    const char *content_type, const char *data, size_t length){
+        char header_buf[512];
+        int res = snprintf(header_buf, sizeof(header_buf),
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Content-Type: %s\r\n"
+                           "Connection: close\r\n\r\n",
+                           status_code, status_text, length, content_type);
+        if (res < 0 || (size_t)res >= sizeof(header_buf)) {
+            return 0;
+        }
+        if (!send_all(client_fd, header_buf, (size_t)res)){
+            return 0;
+        }
+        if(length > 0 && data == NULL){
+            return 0;
+        }
+        if (length > 0){
+            if (!send_all(client_fd, data, length))
+                return 0;
+        }
+        return 1;
+}
+int build_file_path(const char *request_path, char *file_path, size_t file_path_size){
+    if (!request_path || !file_path || file_path_size == 0)    return 0;
+    if (request_path[0] != '/')   return 0;
+    int segment_len = 0;
+    for (size_t i = 0;; i++){
+        char c = request_path[i];
+        if (c == '/' || c == '\0'){
+            if (segment_len == 2 && request_path[i - 2] == '.' && request_path[i - 1] == '.')
+            {
+                return 0;
+            }
+            segment_len = 0;
+        }
+        else
+            segment_len++;
+        if (c == '\0')
+            break;
+    }
+    if (strcmp(request_path, "/") == 0){
+        if (snprintf(file_path, file_path_size, "%s/index.html", "www") >= (int)file_path_size)
+            return 0;
+    }
+    else{
+        if (snprintf(file_path, file_path_size, "%s%s", "www", request_path) >= (int)file_path_size)
+            return 0;
+    }
+    return 1;
+}
+const char *get_mime_type(const char *file_path){
+    if (!file_path){
+        return "application/octet-stream";
+    }
+    const char *dot = strrchr(file_path, '.');
+    if (!dot || strchr(dot, '/') != NULL){
+        return "application/octet-stream";
+    }
+    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0)
+        return "text/html";
+    if (strcmp(dot, ".css") == 0)
+        return "text/css";
+    if (strcmp(dot, ".js") == 0)
+        return "text/javascript";
+    if (strcmp(dot, ".png") == 0)
+        return "image/png";
+    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0)
+        return "image/jpeg";
+    if (strcmp(dot, ".txt") == 0)
+        return "text/plain";
 
+    return "application/octet-stream";
+}
 int http_handle(int client_fd){
     HTTPRequest request;
     char buffer[REQUEST_BUFFER_SIZE];
@@ -129,38 +208,83 @@ int http_handle(int client_fd){
     }
     if (strcmp(request.method, "GET") != 0){
         if (!send_response(client_fd, 405, "Method Not Allowed", "text/html",
-                           "<!DOCTYPE html><html><head><title>405 Method Not Allowed</title></head><body><h1>405 Method Not Allowed</h1></body></html>"))
-        {
+                           "<!DOCTYPE html><html><head><title>405 Method Not Allowed</title></head><body><h1>405 Method Not Allowed</h1></body></html>")){
             return -1;
         }
         return 0;
     }
-    if (strcmp(request.path, "/") == 0){
-        const char *body =
-            "<!DOCTYPE html>"
-            "<html>"
-            "<head><title>Mini HTTP Server</title></head>"
-            "<body>"
-            "<h1>Hello from Mini HTTP Server</h1>"
-            "</body>"
-            "</html>";
-        if (!send_response(client_fd, 200, "OK", "text/html", body))
-        {
+    char file_path[PATH_MAX];
+    if (!build_file_path(request.path, file_path, sizeof(file_path))){
+        fprintf(stderr, "Invalid path or directory traversal detected\n");
+        send_response(client_fd, 400, "Bad Request", "text/html",
+                      "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1></body></html>");
+        return -1;
+    }
+    printf("Filesystem path: %s\n", file_path);
+    int file_fd = open(file_path, O_RDONLY);
+    if (file_fd < 0){
+        if (errno == ENOENT){
+            send_response(client_fd, 404, "Not Found", "text/html",
+                          "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Resource Not Found</h1></body></html>");
+            return 0;    
+        }
+        else if (errno == EACCES){
+            send_response(client_fd, 403, "Forbidden", "text/html",
+                          "<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>");
+                          return 0;
+        }
+        else if(errno == EISDIR){
+            send_response(client_fd, 403, "Forbidden", "text/html",
+                          "<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>");
+                            return 0;
+        }
+        else{
+            send_response(client_fd, 500, "Internal Server Error", "text/html",
+                          "<!DOCTYPE html><html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1></body></html>");
+                          return -1;
+        }
+    }
+    printf("File opened successfully: fd=%d\n", file_fd);
+    struct stat file_info;
+    if(fstat(file_fd, &file_info)==-1){
+        perror("fstat");
+        send_response(client_fd, 500, "Internal Server Error", "text/html",
+                      "<!DOCTYPE html><html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1></body></html>");
+        close(file_fd);
+        return -1;
+    }
+    if (!S_ISREG(file_info.st_mode)){
+        close(file_fd);
+        send_response(
+            client_fd,
+            403,
+            "Forbidden",
+            "text/html",
+            "<!DOCTYPE html><html><body><h1>403 Forbidden</h1></body></html>");
+        return 0;
+    }
+    printf("File size: %ld bytes\n", (long)file_info.st_size);
+    const char *content_type = (char *)get_mime_type(file_path);
+    if (!send_response_body(client_fd, 200, "OK", content_type, NULL, (size_t)file_info.st_size)){
+        close(file_fd);
+        return -1;
+    }
+    char file_buffer[FILE_BUFFER_SIZE];
+    ssize_t bytes_read;
+    while ((bytes_read = read(file_fd, file_buffer, sizeof(file_buffer))) > 0){
+        if (!send_all(client_fd, file_buffer, (size_t)bytes_read)){
+            close(file_fd);
             return -1;
         }
     }
-    else{
-        const char *not_found_body =
-            "<!DOCTYPE html>"
-            "<html>"
-            "<head><title>404 Not Found</title></head>"
-            "<body>"
-            "<h1>404 Resource Not Found</h1>"
-            "</body>"
-            "</html>";
-        if (!send_response(client_fd, 404, "Not Found", "text/html", not_found_body)){
-            return -1;
-        }
+    if (bytes_read < 0){
+        perror("read");
+        close(file_fd);
+        return -1;
     }
+ 
+    close(file_fd);
+
     return 0;
 }
+
