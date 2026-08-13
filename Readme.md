@@ -1,6 +1,6 @@
-# Production-Quality Mini HTTP Server in C
+# Production-Quality Multi-Process HTTP Server in C
 
-A modular, highly-optimized HTTP/1.1 server built for Linux/POSIX systems. Designed from first principles to explore low-level network programming, kernel system calls, memory safety, and event-driven concurrency.
+A modular, highly-optimized HTTP/1.1 server built for Linux/POSIX systems. Designed from first principles to explore low-level network programming, kernel system calls, memory safety, and concurrent processes.
 
 ---
 
@@ -8,29 +8,29 @@ A modular, highly-optimized HTTP/1.1 server built for Linux/POSIX systems. Desig
 
 This project serves as a hands-on systems programming curriculum. Rather than relying on high-level libraries or frameworks, we interface directly with the Linux kernel via POSIX system calls.
 
-* **Deep Understanding Over Speed**: We construct socket listeners, routing engines, thread pools, and parser state machines from scratch to understand the mechanics of the kernel network stack.
+* **Deep Understanding Over Speed**: We construct socket listeners, routing engines, child process lifecycles, and parser state machines from scratch to understand the mechanics of the kernel network stack.
 * **Defensive C Engineering**: We apply strict validation, memory isolation, bounds-checking, and compiler diagnostics to achieve production-grade reliability and security.
 * **Empirical Diagnostics**: We leverage dynamic analysis tools (ASan, Valgrind, strace, perf) to profile bottlenecks, trace kernel-user transitions, and guarantee leak-free execution.
 
 ---
 
-## 🏗️ Execution Architecture (Fork-Based)
+## 🏗️ Concurrency Architecture (Multi-Process Flow)
 
 Under production loads, socket lifecycle transitions, signal handlers, and child process isolation are critical to prevent file descriptor leaks and resource starvation.
 
 ```text
                      Parent Process
                            │
-                    server_accept()  <── [Blocking/Multiplexed Socket]
+                    server_accept()  <── [Interrupted by SIGCHLD -> Retry EINTR]
                            │
                      fork() System Call
                        /       \
                       /         \
            Parent Process       Child Process
                  │                    │
-          close(client_fd)     close(listen_fd)
+          close(client_fd)     close(listen_fd)  <── [Closes listener copy]
                  │                    │
-           accept next          http_handle()  <── [Reads Request]
+           accept next          http_handle()  <── [GET / HEAD Request]
                  │                    │
              [Loop continue]    close(client_fd)
                                       │
@@ -38,7 +38,7 @@ Under production loads, socket lifecycle transitions, signal handlers, and child
                                       │
                                SIGCHLD Signal
                                       ↓
-                               waitpid() Loop
+                               waitpid() Loop  <── [WNOHANG Zombie Cleanup]
 ```
 
 ---
@@ -55,13 +55,13 @@ The codebase undergoes eight sequential stages of evolution. Each version introd
 * **APIs**: Strict buffer traversal pointers (no mutating `strtok`)
 * **Details**: Modular parsing of HTTP requests, path verification, and MIME-type classification. Explores safe buffer handling, prevents path traversal attacks, and routes static files securely.
 
-### V3: I/O Multiplexing with `select()`
-* **APIs**: `select()`, `FD_ZERO()`, `FD_SET()`, `FD_ISSET()`
-* **Details**: Handling multiple concurrent clients using descriptor sets. Investigates the scalability limitations of `FD_SETSIZE` (typically capped at 1024) and the user-to-kernel copy overhead.
+### V3: Multi-Process Concurrency (Current version)
+* **APIs**: `fork()`, `signal(SIGCHLD)`, `waitpid()`, `errno == EINTR`
+* **Details**: Handling multiple concurrent clients via process cloning. Closes unnecessary descriptors in parent/child scopes, intercepts `SIGCHLD`, and reaps zombie processes asynchronously via `WNOHANG`.
 
-### V4: Scalable Multiplexing with `poll()`
-* **APIs**: `poll()`, `struct pollfd`, socket non-blocking configurations
-* **Details**: Moving away from bitmasks to struct arrays to simplify dynamic socket registration. Addresses the descriptor-limit constraint but highlights linear array traversal overhead in the kernel.
+### V4: I/O Multiplexing with `select()` / `poll()`
+* **APIs**: `select()`, `poll()`, `struct pollfd`
+* **Details**: Handling concurrent sockets inside a single process, avoiding process creation overheads, and analyzing FD limits and kernel scan scales.
 
 ### V5: Event-Driven Engine via `epoll()`
 * **APIs**: `epoll_create1()`, `epoll_ctl()`, `epoll_wait()`, non-blocking I/O (`O_NONBLOCK`)
@@ -87,12 +87,17 @@ The implementation is divided into clean, isolated modules to enforce strong sep
 
 ### Socket Listener Subsystem (`include/server.h`)
 * `Server *server_create(int port)`: Allocates and initializes the server structure, binds a socket, sets `SO_REUSEADDR`, and triggers listener mode.
-* `int server_accept(Server *server)`: Wrapper around POSIX `accept` that blocks to pull a connection off the kernel queue.
+* `int server_accept(Server *server)`: Wrapper around POSIX `accept` that blocks to pull a connection off the kernel queue. Retries accept loop when interrupted by `EINTR`.
 * `void server_close(Server *server)`: Tears down memory and closes all open socket descriptors.
 * `void server_close_listener(Server *server)`: Disconnects the listening descriptor while leaving open child client connections unaffected.
 
+### File Utility Module (`include/file.h`)
+* `int build_file_path(const char *request_path, char *file_path, size_t file_path_size)`: Resolves safety/bounds and maps paths to `www/`. Prevents `/../` directory traversal.
+* `const char *get_mime_type(const char *file_path)`: Resolves file extensions to MIME types (`text/html`, `text/css`, `image/png`, etc.).
+
 ### Protocol Processing Subsystem (`include/http.h`)
 * `int http_handle(int client_fd)`: Handles client request parsing, routes requested paths, serves responses, and closes connection descriptors.
+* `int send_response_header(int client_fd, int status_code, const char *status_text, const char *content_type, size_t content_length)`: Composes and sends a standardized HTTP header block.
 
 ---
 
@@ -119,10 +124,12 @@ Web servers are primary attack vectors. We implement strict defenses against typ
 ├── Makefile              # Build automation configurations
 ├── Readme.md             # Architecture and curriculum overview
 ├── include/              # Public module header files
+│   ├── file.h            # Path routing and MIME utility declarations
 │   ├── http.h            # State-machine parsing & handler declarations
 │   └── server.h          # TCP connection and socket manager
 ├── src/                  # Implementation files
-│   ├── main.c            # Application entrypoint & coordinator
+│   ├── file.c            # File routing and MIME classification
+│   ├── main.c            # Application entrypoint & fork-based concurrency
 │   ├── server.c          # Listener configuration and accept loop
 │   └── http.c            # HTTP protocol and response utilities
 └── www/                  # Static HTML assets served by the engine
@@ -177,8 +184,8 @@ gcc -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -Iinclude src/*.c -
   `valgrind --leak-check=full --show-leak-kinds=all ./mini_http`
   Used to identify active memory leaks, dangling pointer references, double-frees, or usage of uninitialized stack values.
 * **System Call Tracing (`strace`)**:
-  `strace -f -e trace=network,desc ./mini_http`
-  Intercepts and records network and descriptor system calls. Allows real-time analysis of `accept`, `recv`, `sendfile`, and socket lifecycles.
+  `strace -f -e trace=network,desc,process ./mini_http`
+  Intercepts and records network and descriptor system calls. Allows real-time analysis of `fork`, `wait4`, `accept`, `recv`, `sendfile`, and socket lifecycles.
 * **CPU Profiling (`perf`)**:
   `perf record -g ./mini_http`
   Profiles hot paths, function runtime footprints, and performance bottlenecks inside user space and kernel space context switches.
@@ -189,7 +196,7 @@ gcc -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -Iinclude src/*.c -
 
 Simulate client workloads using `netcat` (`nc`) or `curl` to test server responses:
 
-### 1. Retrieve Root Resource (Static Index)
+### 1. Retrieve Root Resource (GET)
 ```bash
 # Input Request
 printf "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
@@ -203,7 +210,18 @@ Content-Length: 124
 <html>...
 ```
 
-### 2. Malformed Method Check (Strict Rejection)
+### 2. Retrieve Headers Only (HEAD)
+```bash
+# Input Request
+printf "HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
+
+# Expected Response (No body sent)
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 124
+```
+
+### 3. Malformed Method Check (Strict Rejection)
 ```bash
 # Input Request
 printf "POST / HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
@@ -212,7 +230,7 @@ printf "POST / HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
 HTTP/1.1 405 Method Not Allowed
 ```
 
-### 3. Delimiter Validation Failure
+### 4. Delimiter Validation Failure
 ```bash
 # Input Request (Multiple spaces)
 printf "GET  /  HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
@@ -221,22 +239,13 @@ printf "GET  /  HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
 HTTP/1.1 400 Bad Request
 ```
 
-### 4. Nested Directory Traversal Attempt
+### 5. Nested Directory Traversal Attempt
 ```bash
 # Input Request (Directory traversal prevention check)
 printf "GET /../../etc/passwd HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
 
 # Expected Response
 HTTP/1.1 404 Not Found
-```
-
-### 5. HTTP Version Mismatch
-```bash
-# Input Request (Unsupported client version)
-printf "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n" | nc 127.0.0.1 8080
-
-# Expected Response
-HTTP/1.1 400 Bad Request
 ```
 
 ---
