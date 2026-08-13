@@ -99,6 +99,21 @@ int send_response(int client_fd, int status_code, const char *status_text, const
     }
     return 1;
 }
+int send_response_header(int client_fd, int status_code, const char *status_text,
+                         const char *content_type, size_t content_length){
+    char header_buf[512];
+    int res = snprintf(header_buf, sizeof(header_buf),
+                       "HTTP/1.1 %d %s\r\n"
+                       "Content-Length: %zu\r\n"
+                       "Content-Type: %s\r\n"
+                       "Connection: close\r\n\r\n",
+                       status_code, status_text, content_length, content_type);
+
+    if (res < 0 || (size_t)res >= sizeof(header_buf)){
+        return 0; // Truncation error
+    }
+    return send_all(client_fd, header_buf, (size_t)res);
+}
 int send_response_body(int client_fd, int status_code, const char *status_text, 
     const char *content_type, const char *data, size_t length){
         char header_buf[512];
@@ -123,57 +138,7 @@ int send_response_body(int client_fd, int status_code, const char *status_text,
         }
         return 1;
 }
-int build_file_path(const char *request_path, char *file_path, size_t file_path_size){
-    if (!request_path || !file_path || file_path_size == 0)    return 0;
-    if (request_path[0] != '/')   return 0;
-    int segment_len = 0;
-    for (size_t i = 0;; i++){
-        char c = request_path[i];
-        if (c == '/' || c == '\0'){
-            if (segment_len == 2 && request_path[i - 2] == '.' && request_path[i - 1] == '.')
-            {
-                return 0;
-            }
-            segment_len = 0;
-        }
-        else
-            segment_len++;
-        if (c == '\0')
-            break;
-    }
-    if (strcmp(request_path, "/") == 0){
-        if (snprintf(file_path, file_path_size, "%s/index.html", "www") >= (int)file_path_size)
-            return 0;
-    }
-    else{
-        if (snprintf(file_path, file_path_size, "%s%s", "www", request_path) >= (int)file_path_size)
-            return 0;
-    }
-    return 1;
-}
-const char *get_mime_type(const char *file_path){
-    if (!file_path){
-        return "application/octet-stream";
-    }
-    const char *dot = strrchr(file_path, '.');
-    if (!dot || strchr(dot, '/') != NULL){
-        return "application/octet-stream";
-    }
-    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0)
-        return "text/html";
-    if (strcmp(dot, ".css") == 0)
-        return "text/css";
-    if (strcmp(dot, ".js") == 0)
-        return "text/javascript";
-    if (strcmp(dot, ".png") == 0)
-        return "image/png";
-    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0)
-        return "image/jpeg";
-    if (strcmp(dot, ".txt") == 0)
-        return "text/plain";
 
-    return "application/octet-stream";
-}
 int http_handle(int client_fd){
     HTTPRequest request;
     char buffer[REQUEST_BUFFER_SIZE];
@@ -206,7 +171,7 @@ int http_handle(int client_fd){
                       "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Invalid Request Line</h1></body></html>");
         return -1;
     }
-    if (strcmp(request.method, "GET") != 0){
+    if (strcmp(request.method, "GET") != 0 && strcmp(request.method, "HEAD") != 0){
         if (!send_response(client_fd, 405, "Method Not Allowed", "text/html",
                            "<!DOCTYPE html><html><head><title>405 Method Not Allowed</title></head><body><h1>405 Method Not Allowed</h1></body></html>")){
             return -1;
@@ -264,10 +229,15 @@ int http_handle(int client_fd){
         return 0;
     }
     printf("File size: %ld bytes\n", (long)file_info.st_size);
-    const char *content_type = (char *)get_mime_type(file_path);
-    if (!send_response_body(client_fd, 200, "OK", content_type, NULL, (size_t)file_info.st_size)){
+    const char *content_type = get_mime_type(file_path);
+    if (!send_response_header(client_fd,   200,  "OK", content_type,
+            (size_t)file_info.st_size)){
         close(file_fd);
         return -1;
+    }
+    if (strcmp(request.method, "HEAD") == 0){
+        close(file_fd);
+        return 0;
     }
     char file_buffer[FILE_BUFFER_SIZE];
     ssize_t bytes_read;
@@ -287,4 +257,3 @@ int http_handle(int client_fd){
 
     return 0;
 }
-

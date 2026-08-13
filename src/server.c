@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <netinet/in.h>
+#include <errno.h>
 #include "server.h"
 
 struct Server{
@@ -43,19 +44,28 @@ Server *server_create(int port){
 int server_accept(Server *server){
     struct sockaddr_in client_addr = {0};
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(
-        server->listen_fd,
-        (struct sockaddr *)&client_addr, &client_len);
-    if(client_fd<0){
+    while(1){
+        int client_fd = accept(
+            server->listen_fd,
+            (struct sockaddr *)&client_addr, &client_len);
+        if(client_fd>=0) return client_fd;
+        if (errno == EINTR) continue; // interrupted by signal, retry
         perror("accept");
         return -1;
     }
-    return client_fd;
+    
 }
 
 void server_close(Server *server){
     if(server!=NULL){
         if(server->listen_fd>=0) close(server->listen_fd);
         free(server);
+    }
+}
+
+void server_close_listener(Server *server){
+    if(server!=NULL && server->listen_fd>=0){
+        close(server->listen_fd);
+        server->listen_fd = -1;
     }
 }

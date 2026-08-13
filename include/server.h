@@ -9,4 +9,5 @@ int server_accept(Server *server);
 
 void server_close(Server *server);
 
+void server_close_listener(Server *server);
 #endif
