@@ -10,4 +10,6 @@ int server_accept(Server *server);
 void server_close(Server *server);
 
 void server_close_listener(Server *server);
+
+int server_get_listen_fd(Server *server);
 #endif

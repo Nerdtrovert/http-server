@@ -41,6 +41,11 @@ Server *server_create(int port){
     return server;
 }
 
+int server_get_listen_fd(Server *server){
+    if(server==NULL) return -1;
+    return server->listen_fd;
+}
+
 int server_accept(Server *server){
     struct sockaddr_in client_addr = {0};
     socklen_t client_len = sizeof(client_addr);

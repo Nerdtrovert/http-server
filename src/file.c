@@ -1,6 +1,8 @@
-#include "file.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include "file.h"
 
 int build_file_path(const char *request_path, char *file_path, size_t file_path_size){
     if (!request_path || !file_path || file_path_size == 0)
