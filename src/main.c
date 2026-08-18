@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include "server.h"
 #include "http.h"
@@ -10,44 +11,52 @@
 #define REQUEST_BUFFER_SIZE 4096
 #define FILE_BUFFER_SIZE 4096
 
+struct pollfd poll_fds[FD_SETSIZE];
 static Client clients[FD_SETSIZE];
-
-static void close_client(int fd, fd_set *read_set, fd_set *write_set){
+static void remove_client(int index, int *poll_count){
+    int fd = poll_fds[index].fd;
     if (clients[fd].file_fd >= 0){
         close(clients[fd].file_fd);
-        clients[fd].file_fd = -1;
     }
     close(fd);
-    FD_CLR(fd, read_set);
-    FD_CLR(fd, write_set);
     clients[fd] = (Client){0};
     clients[fd].file_fd = -1;
+    poll_fds[index] = poll_fds[*poll_count - 1];
+    (*poll_count)--;
 }
 int main(void){
     Server *server = server_create(8080);
-    if(server==NULL){
-        fprintf(stderr, "Failed to create server\n");   
+    if (server == NULL)
+    {
+        fprintf(stderr, "Failed to create server\n");
         return 1;
     }
     printf("Server listening on port 8080\n");
-    fd_set master_read_set, master_write_set, read_set, write_set;
-    FD_ZERO(&master_read_set);
-    FD_ZERO(&master_write_set);
-    int listen_fd=server_get_listen_fd(server);
-    int max_fd=listen_fd;
-    FD_SET(listen_fd, &master_read_set);
-    while(1){
-        read_set = master_read_set;
-        write_set = master_write_set;
-        if (select(max_fd + 1, &read_set, &write_set, NULL, NULL) < 0){
+
+    int listen_fd = server_get_listen_fd(server);
+    int poll_count = 0;
+
+    poll_fds[0].fd = listen_fd;
+    poll_fds[0].events = POLLIN;
+    poll_fds[0].revents = 0;
+    poll_count = 1;
+
+    while (1){
+        int ready = poll(poll_fds, poll_count, -1);
+        if (ready < 0){
             if (errno == EINTR)
                 continue;
-            perror("select");
+            perror("poll");
             break;
         }
-        for (int fd=0;fd<=max_fd;fd++){
-            if (FD_ISSET(fd, &read_set)){
-                if (fd == listen_fd) {
+        for (int i = 0; i < poll_count; i++){
+            if (poll_fds[i].revents == 0)
+                continue;
+
+            int fd = poll_fds[i].fd;
+
+            if (poll_fds[i].revents & POLLIN){
+                if (fd == listen_fd){
                     int client_fd = server_accept(server);
                     if (client_fd < 0)
                         continue;
@@ -58,46 +67,75 @@ int main(void){
                         close(client_fd);
                         continue;
                     }
-
                     if (fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1){
                         perror("fcntl(F_SETFL)");
                         close(client_fd);
                         continue;
                     }
-                    clients[client_fd].received = 0;
+                    if (poll_count >= FD_SETSIZE){
+                        close(client_fd);
+                        fprintf(stderr, "Maximum clients reached\n");
+                        continue;
+                    }
+                    poll_fds[poll_count].fd = client_fd;
+                    poll_fds[poll_count].events = POLLIN;
+                    poll_fds[poll_count].revents = 0;
+                    poll_count++;
+                    clients[client_fd] = (Client){0};
                     clients[client_fd].file_fd = -1;
-                    FD_SET(client_fd, &master_read_set);
-                    if (client_fd > max_fd)
-                        max_fd = client_fd;
                 }
                 else{
                     Client *c = &clients[fd];
-                    ssize_t n = recv(fd, c->buffer + c->received, sizeof(c->buffer) - c->received, 0);
+                    ssize_t n = recv(
+                        fd,
+                        c->buffer + c->received,
+                        sizeof(c->buffer) - c->received,
+                        0);
                     if (n > 0){
                         c->received += (size_t)n;
-                        if (find_header_end(c->buffer, c->received) >= 0) {
-                            http_process_request(c, c->buffer, c->received);
-                            FD_CLR(fd, &master_read_set);
-                            FD_SET(fd, &master_write_set);
+                        if (find_header_end(c->buffer, c->received) >= 0){
+                            if (http_process_request( c,  c->buffer,  c->received) < 0){
+                                close(fd);
+                                poll_fds[i] = poll_fds[poll_count - 1];
+                                poll_count--;
+                                i--;continue;
+                            }
+                            //Request is complete. Switch this client from READ → WRITE.
+                            poll_fds[i].events = POLLOUT;
+                            c->received = 0;
                         }
                     }
-                    else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)){
-                        close_client(fd, &master_read_set, &master_write_set);
+                    else if (n == 0){
+                        // client disconnected
+                        close(fd);
+                        poll_fds[i] =  poll_fds[poll_count - 1];
+                        poll_count--;
+                        i--;
+                    }else if (errno != EAGAIN && errno != EWOULDBLOCK){
+                        perror("recv");
+                        close(fd);
+                        poll_fds[i] =  poll_fds[poll_count - 1];
+                        poll_count--;
+                        i--;
                     }
                 }
             }
-            if (FD_ISSET(fd, &write_set)){
+            // ==================== WRITE READY ====================
+            if (poll_fds[i].revents & POLLOUT){
                 Client *c = &clients[fd];
-                // 1. Send HTTP headers or error body
+                // Phase 1: Send headers (or error response body)
                 if (c->response_sent < c->response_length){
-                    ssize_t n = send(fd, c->response + c->response_sent, c->response_length - c->response_sent, 0);
-                    if (n > 0)    c->response_sent += (size_t)n;
+                    ssize_t n = send( fd, c->response + c->response_sent, c->response_length - c->response_sent,
+                        0);
+                    if (n > 0) c->response_sent += (size_t)n;
                     else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK){
-                        close_client(fd, &master_read_set, &master_write_set);
+                        perror("send");
+                        remove_client(i, &poll_count);
+                        i--;
                     }
-                    continue;
+                    continue; // Stay in POLLOUT, don't stream file until headers finish
                 }
-                // 2. Stream static file (GET requests)
+                // Phase 2: Headers are done -> Stream file body (if GET request with file_fd)
                 if (c->file_fd >= 0 && c->file_sent < c->file_size){
                     char file_buf[FILE_BUFFER_SIZE];
                     ssize_t r = read(c->file_fd, file_buf, sizeof(file_buf));
@@ -105,28 +143,31 @@ int main(void){
                         ssize_t s = send(fd, file_buf, (size_t)r, 0);
                         if (s > 0){
                             c->file_sent += (size_t)s;
-                            // If socket didn't take all read bytes, rewind file offset
+                            // If kernel socket buffer accepted fewer bytes than read, rewind file
                             if (s < r){
                                 lseek(c->file_fd, s - r, SEEK_CUR);
                             }
                         }
-                        else if (s < 0){
-                            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                                lseek(c->file_fd, -r, SEEK_CUR);
-                            else
-                                close_client(fd, &master_read_set, &master_write_set);
-                            
+                        else if (s < 0 && errno != EAGAIN && errno != EWOULDBLOCK){
+                            perror("send file");
+                            remove_client(i, &poll_count);
+                            i--;
                         }
                     }
-                    else{
-                        // EOF or read error
-                        close_client(fd, &master_read_set, &master_write_set);
+                    else if (r == 0){
+                        remove_client(i, &poll_count);
+                        i--;
+                    }
+                    else if (r < 0){
+                        perror("read");
+                        remove_client(i, &poll_count);
+                        i--;
                     }
                     continue;
                 }
-
-                // 3. Response completely finished
-                close_client(fd, &master_read_set, &master_write_set);
+                // Phase 3: Everything sent (e.g. HEAD request or error response) -> Close
+                remove_client(i, &poll_count);
+                i--;
             }
         }
     }

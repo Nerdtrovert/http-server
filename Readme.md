@@ -1,6 +1,6 @@
-# Production-Quality Multi-Process HTTP Server in C
+# Production-Quality I/O Multiplexed HTTP Server in C
 
-A modular, highly-optimized HTTP/1.1 server built for Linux/POSIX systems. Designed from first principles to explore low-level network programming, kernel system calls, memory safety, and concurrent processes.
+A modular, highly-optimized HTTP/1.1 server built for Linux/POSIX systems. Designed from first principles to explore low-level network programming, kernel system calls, memory safety, and concurrent connection handling.
 
 ---
 
@@ -14,38 +14,45 @@ This project serves as a hands-on systems programming curriculum. Rather than re
 
 ---
 
-## 🏗️ Concurrency Architecture (Multi-Process Flow)
+## 🏗️ Concurrency Architecture (I/O Multiplexing Flow)
 
-Under production loads, socket lifecycle transitions, signal handlers, and child process isolation are critical to prevent file descriptor leaks and resource starvation.
+Under production loads, I/O multiplexing with `select()` or `poll()` allows handling multiple concurrent connections within a single process, eliminating process creation overhead while efficiently managing file descriptors.
 
 ```text
-                     Parent Process
-                           │
-                    server_accept()  <── [Interrupted by SIGCHLD -> Retry EINTR]
-                           │
-                     fork() System Call
-                       /       \
-                      /         \
-           Parent Process       Child Process
-                 │                    │
-          close(client_fd)     close(listen_fd)  <── [Closes listener copy]
-                 │                    │
-           accept next          http_handle()  <── [GET / HEAD Request]
-                 │                    │
-             [Loop continue]    close(client_fd)
-                                      │
-                                   _exit(0)
-                                      │
-                               SIGCHLD Signal
-                                      ↓
-                               waitpid() Loop  <── [WNOHANG Zombie Cleanup]
+                          Single Process
+                                 │
+                     server_accept()  <── [Handles EINTR by retrying]
+                                 │
+                      Add new FD to fd_set/array
+                                 │
+                          select()/poll() call
+                                 │
+                        Ready FDs detected
+                                 │
+          ┌──────────────────────┼──────────────────────┐
+          │                      │                      │
+   New connection       Data to read       Data to write
+          │                      │                      │
+   Accept client    Read request   Write response
+          │                      │                      │
+   Add to set       Process req    Send data
+          │                      │                      │
+   Monitor for    Check for      Monitor for
+   readability    completion     writability
+          │                      │                      │
+  ┌─────────┐   └──────────┐   ┌────────────┐
+   │         │              │  │            │
+Process   Close if     Remove     Close if
+client    done/error    from set   done/error
+          │                      │                      │
+   Continue loop          Continue loop        Continue loop
 ```
 
 ---
 
 ## 🗺️ Learning Roadmap & Evolution
 
-The codebase undergoes eight sequential stages of evolution. Each version introduces specific kernel APIs, architectures, and performance challenges:
+The codebase undergoes nine sequential stages of evolution. Each version introduces specific kernel APIs, architectures, and performance challenges:
 
 ### V1: Blocking Single-Client TCP Server
 * **APIs**: `socket()`, `bind()`, `listen()`, `accept()`, `read()`, `write()`
@@ -55,27 +62,31 @@ The codebase undergoes eight sequential stages of evolution. Each version introd
 * **APIs**: Strict buffer traversal pointers (no mutating `strtok`)
 * **Details**: Modular parsing of HTTP requests, path verification, and MIME-type classification. Explores safe buffer handling, prevents path traversal attacks, and routes static files securely.
 
-### V3: Multi-Process Concurrency (Current version)
+### V3: Multi-Process Concurrency
 * **APIs**: `fork()`, `signal(SIGCHLD)`, `waitpid()`, `errno == EINTR`
 * **Details**: Handling multiple concurrent clients via process cloning. Closes unnecessary descriptors in parent/child scopes, intercepts `SIGCHLD`, and reaps zombie processes asynchronously via `WNOHANG`.
 
-### V4: I/O Multiplexing with `select()` / `poll()`
-* **APIs**: `select()`, `poll()`, `struct pollfd`
-* **Details**: Handling concurrent sockets inside a single process, avoiding process creation overheads, and analyzing FD limits and kernel scan scales.
+### V4: I/O Multiplexing with `select()`
+* **APIs**: `select()`, `fd_set`, `FD_SET`, `FD_CLR`
+* **Details**: Handling concurrent sockets inside a single process, avoiding process creation overheads, and analyzing the `FD_SETSIZE` ceiling and bitmask limitations.
 
-### V5: Event-Driven Engine via `epoll()`
+### V5: I/O Multiplexing with `poll()` (Current version)
+* **APIs**: `poll()`, `struct pollfd`, `POLLIN`, `POLLOUT`
+* **Details**: Using dynamically allocated/sized arrays of descriptors, separating input events from output revents, and implementing $O(1)$ connection array compaction to avoid linear shift overheads.
+
+### V6: Event-Driven Engine via `epoll()`
 * **APIs**: `epoll_create1()`, `epoll_ctl()`, `epoll_wait()`, non-blocking I/O (`O_NONBLOCK`)
 * **Details**: Harnessing Linux-specific event queues. Explores Level-Triggered (LT) vs Edge-Triggered (ET) notification modes and implements non-blocking read/write loops to handle massive traffic spikes.
 
-### V6: Multi-Threaded Concurrency
+### V7: Multi-Threaded Concurrency
 * **APIs**: `pthread_create()`, `pthread_mutex_t`, `pthread_cond_t`
 * **Details**: Building thread-safe shared work queues and worker thread pools. Avoids the overhead of process creation (`fork`), focuses on synchronization primitives, and resolves potential race conditions.
 
-### V7: Zero-Copy Optimizations
+### V8: Zero-Copy Optimizations
 * **APIs**: `sendfile()`, `mmap()`, `munmap()`
 * **Details**: Optimizing file reads by bypassing user-space buffer copies for high-throughput I/O. Reduces context switches and offloads paging and disk-to-socket transfers directly to the Linux page cache.
 
-### V8: Daemonization & Hardening
+### V9: Daemonization & Hardening
 * **APIs**: `sigaction()`, `fork()`, `setsid()`, `syslog()`, `chroot()`
 * **Details**: Proper daemonization process lifecycle, syslog integration, signal safety, and clean signal-based shutdown. Ensures the server runs gracefully as a persistent background daemon.
 
@@ -113,7 +124,7 @@ Web servers are primary attack vectors. We implement strict defenses against typ
 ### 2. Socket and Memory Security
 * **Zero-Copy Buffer Slicing**: Rather than mutating inputs using `strtok()`, our HTTP parser uses absolute pointer offsets and length boundaries to mitigate null-byte injection attacks.
 * **Fractional Send Loop**: TCP does not guarantee complete payload delivery in a single `write()` call. We implement `send_all()` loops to retry partial socket transmissions, checking socket states via loop iterations.
-* **Zombie Process Cleanup**: When processes exit, their descriptor remains in zombie states. We catch `SIGCHLD` and run a non-blocking `waitpid(-1, NULL, WNOHANG)` loop to recycle resources instantly.
+* **FD Resource Management**: We track all file descriptors in our fd_set/array and ensure proper cleanup when connections close to prevent resource leaks.
 
 ---
 
@@ -129,7 +140,7 @@ Web servers are primary attack vectors. We implement strict defenses against typ
 │   └── server.h          # TCP connection and socket manager
 ├── src/                  # Implementation files
 │   ├── file.c            # File routing and MIME classification
-│   ├── main.c            # Application entrypoint & fork-based concurrency
+│   ├── main.c            # Application entrypoint & I/O multiplexing logic
 │   ├── server.c          # Listener configuration and accept loop
 │   └── http.c            # HTTP protocol and response utilities
 └── www/                  # Static HTML assets served by the engine
@@ -185,7 +196,7 @@ gcc -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -Iinclude src/*.c -
   Used to identify active memory leaks, dangling pointer references, double-frees, or usage of uninitialized stack values.
 * **System Call Tracing (`strace`)**:
   `strace -f -e trace=network,desc,process ./mini_http`
-  Intercepts and records network and descriptor system calls. Allows real-time analysis of `fork`, `wait4`, `accept`, `recv`, `sendfile`, and socket lifecycles.
+  Intercepts and records network and descriptor system calls. Allows real-time analysis of `select()`, `poll()`, `accept()`, `recv()`, `send()`, `sendfile()`, and socket lifecycles.
 * **CPU Profiling (`perf`)**:
   `perf record -g ./mini_http`
   Profiles hot paths, function runtime footprints, and performance bottlenecks inside user space and kernel space context switches.
@@ -249,14 +260,3 @@ HTTP/1.1 404 Not Found
 ```
 
 ---
-
-## 🤝 Systems Careers & Mentorship
-
-We follow strict pair-programming principles: Concept first, API validation, modular isolation, and static/dynamic review.
-
-We are actively recruiting systems programmers who love:
-* Micro-optimizing edge cases in Linux kernel system calls.
-* Resolving complex race conditions in concurrent data structures.
-* Profiling memory footprints down to the byte.
-
-If you enjoy reading Linux man pages, debugging assembly in GDB, and writing highly-optimized C, join our core development team!
